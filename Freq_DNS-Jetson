@@ -1,0 +1,332 @@
+import math
+import serial
+import struct
+import threading
+import time
+
+# =========================================================================
+# 1. CONFIGURACIÓN DE PUERTOS Y PROTOCOLO HIWONDER HTD-35H
+# =========================================================================
+PUERTO_ESP32 = '/dev/ttyUSB0'
+PUERTO_SERVO = '/dev/ttyTHS1'
+BAUDIOS      = 115200
+SERVO_ID     = 4
+
+CMD_SERVO_MOVE_TIME_WRITE      = 1
+CMD_SERVO_VIN_READ             = 27
+CMD_SERVO_POS_READ             = 28
+CMD_SERVO_OR_MOTOR_MODE_WRITE  = 29
+CMD_SERVO_LOAD_OR_UNLOAD_WRITE = 31  # 1 = Torque ON, 0 = Torque OFF (cede)
+
+GRADOS_POR_CUENTA = 240.0 / 1000.0
+CUENTA_MIN        = 50
+CUENTA_MAX        = 950
+
+# =========================================================================
+# 2. PARÁMETROS DE OSCILACIÓN Y DETECCIÓN DINÁMICA DE FUERZA
+# =========================================================================
+FREQ_MIN_HZ      = 0.20    # Hz (ADC = 0)
+FREQ_MAX_HZ      = 2.50    # Hz (ADC = 4095)
+EMA_ALPHA_ADC    = 0.25    # Respuesta ágil del potenciómetro
+
+AMPLITUD_MAX_DEG = 35.0    # Amplitud nominal en bajas frecuencias (±35°)
+VEL_SEGURA_DEG_S = 250.0   # Límite seguro (< 333°/s máx. físico del HTD-35H)
+OFFSET_DEG       = 120.0   # Centro de oscilación (usa 60.0 si tu centro es cuenta 250)
+DT_OBJETIVO_S    = 0.020   # Lazo a 50 Hz (20 ms)
+
+# Compensación de movimiento libre (resta el esfuerzo propio de acelerar el brazo)
+R_LINEA          = 0.15    # Resistencia de línea/fuente en Ohmios
+I_VACIO          = 0.10    # Corriente nominal en vacío (A)
+K_I_VEL          = 0.0018  # Corriente extra por velocidad (°/s) -> ajústalo si es necesario
+K_I_ACC          = 0.00025 # Corriente extra por aceleración (°/s²) -> compensa inercia en alta f
+EMA_ALPHA_I      = 0.50    # Filtro rápido (menos retraso)
+
+# Umbrales sobre el RESIDUAL (fuerza externa pura, ya sin inercia propia)
+I_EXT_UMBRAL_A   = 0.60    # Amperios EXTRA por encima del movimiento libre
+ERR_BASE_DEG     = 4.5     # Tolerancia base de posición en reposo (°)
+K_ERR_VEL        = 0.030   # Tolerancia extra por velocidad (s) -> 30 ms de lag mecánico
+CICLOS_CONFIRM   = 2       # Ciclos consecutivos (~40 ms) para confirmar fuerza real
+TIEMPO_CEDER_S   = 1.2     # Segundos liberado antes de reanudar
+
+# Estado compartido entre hilos
+lock_adc = threading.Lock()
+adc_crudo_compartido = 0
+evento_detener = threading.Event()
+
+
+# =========================================================================
+# FUNCIONES DEL PROTOCOLO HIWONDER HTD-35H (LECTURA RÁPIDA SIN LAG)
+# =========================================================================
+def checksum_hiwonder(datos):
+    return (~sum(datos)) & 0xFF
+
+
+def asegurar_modo_servo(ser_servo, servo_id):
+    pwm_l, pwm_h = struct.pack('<h', 0)
+    cuerpo = [servo_id, 7, CMD_SERVO_OR_MOTOR_MODE_WRITE, 0, 0, pwm_l, pwm_h]
+    ser_servo.write(bytearray([0x55, 0x55] + cuerpo + [checksum_hiwonder(cuerpo)]))
+
+
+def control_torque_cmd31(ser_servo, servo_id, activar):
+    cuerpo = [servo_id, 4, CMD_SERVO_LOAD_OR_UNLOAD_WRITE, 1 if activar else 0]
+    ser_servo.write(bytearray([0x55, 0x55] + cuerpo + [checksum_hiwonder(cuerpo)]))
+
+
+def mover_servo_cmd1(ser_servo, servo_id, cuentas, tiempo_ms):
+    cuentas = max(CUENTA_MIN, min(CUENTA_MAX, int(round(cuentas))))
+    tiempo_ms = max(0, min(30000, int(round(tiempo_ms))))
+    pos_l, pos_h   = cuentas & 0xFF, (cuentas >> 8) & 0xFF
+    time_l, time_h = tiempo_ms & 0xFF, (tiempo_ms >> 8) & 0xFF
+    cuerpo = [servo_id, 7, CMD_SERVO_MOVE_TIME_WRITE, pos_l, pos_h, time_l, time_h]
+    ser_servo.write(bytearray([0x55, 0x55] + cuerpo + [checksum_hiwonder(cuerpo)]))
+
+
+def solicitar_lectura_rapida(ser_servo, servo_id, cmd, signed=False):
+    """Lee la trama de respuesta de 8 bytes sin quedarse colgado esperando 14 bytes."""
+    ser_servo.reset_input_buffer()
+    cuerpo = [servo_id, 3, cmd]
+    ser_servo.write(bytearray([0x55, 0x55] + cuerpo + [checksum_hiwonder(cuerpo)]))
+
+    # Primero lee 8 bytes (respuesta directa sin eco). Si hubo eco TX de 6 bytes, lee los 6 restantes.
+    raw = ser_servo.read(8)
+    if len(raw) < 8:
+        return None
+
+    # Si los primeros 6 bytes son nuestro eco TX (length == 3), lee los 6 bytes faltantes de RX
+    if raw[0] == 0x55 and raw[1] == 0x55 and raw[2] == servo_id and raw[3] == 3:
+        raw += ser_servo.read(6)
+
+    for i in range(len(raw) - 7):
+        if (raw[i] == 0x55 and raw[i+1] == 0x55 and
+                raw[i+2] == servo_id and raw[i+3] == 5 and raw[i+4] == cmd):
+            if checksum_hiwonder(raw[i+2:i+7]) == raw[i+7]:
+                return struct.unpack('<h' if signed else '<H', raw[i+5:i+7])[0]
+    return None
+
+
+def grados_a_cuentas(angulo_deg):
+    return angulo_deg / GRADOS_POR_CUENTA
+
+
+def cuentas_a_grados(cuentas):
+    return cuentas * GRADOS_POR_CUENTA
+
+
+# =========================================================================
+# HILO 1: LECTURA SERIAL SIN LAG DEL ESP32 (/dev/ttyUSB0)
+# =========================================================================
+def hilo_lectura_serial(ser_esp):
+    global adc_crudo_compartido
+    buffer_rx = ""
+
+    while not evento_detener.is_set():
+        try:
+            bytes_pendientes = ser_esp.in_waiting
+            if bytes_pendientes > 0:
+                bloque = ser_esp.read(bytes_pendientes).decode('ascii', errors='ignore')
+                buffer_rx += bloque
+                if '\n' in buffer_rx:
+                    lineas = buffer_rx.split('\n')
+                    buffer_rx = lineas[-1]
+                    for linea in reversed(lineas[:-1]):
+                        txt = linea.strip()
+                        if txt.isdigit():
+                            val = int(txt)
+                            if 0 <= val <= 4095:
+                                with lock_adc:
+                                    adc_crudo_compartido = val
+                                break
+            else:
+                time.sleep(0.002)
+        except serial.SerialException as e:
+            print(f"\n[ERROR SERIAL ESP32] {e}")
+            evento_detener.set()
+            break
+
+
+# =========================================================================
+# HILO 2: CONTROL DE OSCILACIÓN + COMPENSACIÓN INERCIAL + COMPLIANCIA
+# =========================================================================
+def hilo_control_servo(ser_servo):
+    asegurar_modo_servo(ser_servo, SERVO_ID)
+    control_torque_cmd31(ser_servo, SERVO_ID, True)
+    time.sleep(0.05)
+
+    cuentas_centro = grados_a_cuentas(OFFSET_DEG)
+    mover_servo_cmd1(ser_servo, SERVO_ID, cuentas_centro, 600)
+    time.sleep(0.8)
+
+    # Calibración de voltaje en reposo (CMD 27)
+    lecturas_v = []
+    for _ in range(15):
+        v_mv = solicitar_lectura_rapida(ser_servo, SERVO_ID, CMD_SERVO_VIN_READ, signed=False)
+        if v_mv is not None and 5000 <= v_mv <= 16000:
+            lecturas_v.append(v_mv / 1000.0)
+        time.sleep(0.005)
+
+    if lecturas_v:
+        lecturas_v.sort()
+        v_reposo = lecturas_v[len(lecturas_v) // 2]
+        print(f"[CALIBRACIÓN] V_reposo = {v_reposo:.2f} V | Umbral I_ext = {I_EXT_UMBRAL_A:.2f} A\n")
+    else:
+        v_reposo = 11.1
+        print(f"[AVISO] Sin respuesta de CMD 27. Usando V_reposo = {v_reposo:.2f} V\n")
+
+    with lock_adc:
+        adc_filtrado = float(adc_crudo_compartido)
+
+    fase = 0.0
+    angulo_obj_deg = OFFSET_DEG
+    angulo_enviado_prev = OFFSET_DEG
+    angulo_real_deg = OFFSET_DEG
+    v_actual = v_reposo
+    i_ext_filtrada = 0.0
+
+    cediendo = False
+    t_fin_ceder = 0.0
+    conteo_fuerza = 0
+
+    t_prev = time.perf_counter()
+    ciclo = 0
+    tiempo_cmd_ms = int(DT_OBJETIVO_S * 1000)
+
+    print(f"{'Estado':<8} | {'Freq':>5} | {'Amp':>4} | {'Err(°)':>6} | {'LimE':>5} | {'I_tot':>5} | {'I_ext':>5} | {'dt(ms)':>6}")
+    print("-" * 64)
+
+    while not evento_detener.is_set():
+        t_ahora = time.perf_counter()
+        dt = t_ahora - t_prev
+        t_prev = t_ahora
+        if dt > 0.1:
+            dt = DT_OBJETIVO_S
+
+        # 1. Leer potenciómetro (EMA rápido) y mapear frecuencia
+        with lock_adc:
+            adc_raw = adc_crudo_compartido
+        adc_filtrado = (EMA_ALPHA_ADC * adc_raw) + ((1.0 - EMA_ALPHA_ADC) * adc_filtrado)
+        freq_hz = FREQ_MIN_HZ + (adc_filtrado / 4095.0) * (FREQ_MAX_HZ - FREQ_MIN_HZ)
+
+        # 2. Proteger el límite físico de velocidad del HTD-35H (evita saturación en alta f)
+        omega = 2.0 * math.pi * freq_hz
+        amp_actual = min(AMPLITUD_MAX_DEG, VEL_SEGURA_DEG_S / max(omega, 0.1))
+
+        # 3. Leer posición Y voltaje en CADA ciclo (rápido: ~3.5 ms en total)
+        pos_c = solicitar_lectura_rapida(ser_servo, SERVO_ID, CMD_SERVO_POS_READ, signed=True)
+        if pos_c is not None and 0 <= pos_c <= 1000:
+            angulo_real_deg = cuentas_a_grados(pos_c)
+
+        v_mv = solicitar_lectura_rapida(ser_servo, SERVO_ID, CMD_SERVO_VIN_READ, signed=False)
+        if v_mv is not None and 5000 <= v_mv <= 16000:
+            v_actual = v_mv / 1000.0
+
+        # 4. Estimación de corriente total y resta de corriente de movimiento libre
+        caida_v = max(0.0, v_reposo - v_actual)
+        if caida_v < 0.015:
+            caida_v = 0.0
+        i_total = I_VACIO + (caida_v / R_LINEA)
+
+        vel_obj = abs(omega * amp_actual * math.cos(fase))
+        acc_obj = abs((omega ** 2) * amp_actual * math.sin(fase))
+        i_libre_esperada = I_VACIO + (K_I_VEL * vel_obj) + (K_I_ACC * acc_obj)
+
+        # Corriente residual atribuible únicamente a una fuerza externa
+        i_ext_inst = max(0.0, i_total - i_libre_esperada)
+        i_ext_filtrada = (EMA_ALPHA_I * i_ext_inst) + ((1.0 - EMA_ALPHA_I) * i_ext_filtrada)
+
+        # Error respecto al objetivo que se envió el ciclo ANTERIOR (elimina desfase de CMD 1)
+        error_deg = abs(angulo_enviado_prev - angulo_real_deg)
+        error_umbral = ERR_BASE_DEG + (K_ERR_VEL * vel_obj)
+
+        # 5. Máquina de estados: OSCILANDO vs CEDIENDO
+        if cediendo:
+            if t_ahora >= t_fin_ceder:
+                cediendo = False
+                conteo_fuerza = 0
+                i_ext_filtrada = 0.0
+                control_torque_cmd31(ser_servo, SERVO_ID, True)
+
+                # Sincronizar fase con el ángulo real donde quedó el eslabón
+                norm = max(-1.0, min(1.0, (angulo_real_deg - OFFSET_DEG) / max(amp_actual, 1.0)))
+                fase = math.asin(norm)
+                angulo_enviado_prev = angulo_real_deg
+                print(f">>> [REANUDANDO] Desde {angulo_real_deg:.1f}°")
+        else:
+            # Detectar oposición real: corriente residual alta Y retraso por encima del lag natural
+            if i_ext_filtrada >= I_EXT_UMBRAL_A and error_deg >= error_umbral:
+                conteo_fuerza += 1
+            else:
+                conteo_fuerza = 0
+
+            if conteo_fuerza >= CICLOS_CONFIRM:
+                cediendo = True
+                t_fin_ceder = t_ahora + TIEMPO_CEDER_S
+                control_torque_cmd31(ser_servo, SERVO_ID, False)
+                print(
+                    f">>> [FUERZA REAL] I_ext={i_ext_filtrada:.2f}A (I_tot={i_total:.2f}A) | "
+                    f"Err={error_deg:.1f}° (Lim={error_umbral:.1f}°) -> CEDIENDO"
+                )
+            else:
+                fase = (fase + omega * dt) % (2.0 * math.pi)
+                angulo_obj_deg = amp_actual * math.sin(fase) + OFFSET_DEG
+                mover_servo_cmd1(ser_servo, SERVO_ID, grados_a_cuentas(angulo_obj_deg), tiempo_cmd_ms)
+                angulo_enviado_prev = angulo_obj_deg
+
+        ciclo += 1
+        if ciclo % 10 == 0:
+            estado_txt = "CEDIENDO" if cediendo else "OSCILAND"
+            print(
+                f"{estado_txt:<8} | {freq_hz:5.2f} | {amp_actual:4.1f} | "
+                f"{error_deg:6.1f} | {error_umbral:5.1f} | {i_total:5.2f} | "
+                f"{i_ext_filtrada:5.2f} | {dt * 1000.0:6.1f}"
+            )
+
+        t_restante = DT_OBJETIVO_S - (time.perf_counter() - t_ahora)
+        if t_restante > 0:
+            time.sleep(t_restante)
+
+    control_torque_cmd31(ser_servo, SERVO_ID, True)
+    mover_servo_cmd1(ser_servo, SERVO_ID, cuentas_centro, 500)
+
+
+# =========================================================================
+# PUNTO DE ENTRADA
+# =========================================================================
+def main():
+    ser_esp = None
+    ser_servo = None
+
+    try:
+        ser_servo = serial.Serial(PUERTO_SERVO, BAUDIOS, timeout=0.002)
+        print(f"[OK] Servo HTD-35H abierto en {PUERTO_SERVO} ({BAUDIOS} bps, ID={SERVO_ID}).")
+
+        ser_esp = serial.Serial(PUERTO_ESP32, BAUDIOS, timeout=0.05)
+        time.sleep(1.5)
+        ser_esp.reset_input_buffer()
+        print(f"[OK] ESP32 abierto en {PUERTO_ESP32} ({BAUDIOS} bps).\n")
+
+        t_rx = threading.Thread(target=hilo_lectura_serial, args=(ser_esp,), daemon=True)
+        t_ctrl = threading.Thread(target=hilo_control_servo, args=(ser_servo,), daemon=True)
+
+        t_rx.start()
+        t_ctrl.start()
+
+        print("Sistema activo. Observa 'I_ext' y 'Err' al subir la frecuencia (Ctrl+C para salir).\n")
+        while not evento_detener.is_set():
+            time.sleep(0.2)
+
+    except serial.SerialException as e:
+        print(f"[ERROR] No se pudo abrir un puerto serial: {e}")
+    except KeyboardInterrupt:
+        print("\n[DETENIDO] Cerrando sistema de forma segura...")
+    finally:
+        evento_detener.set()
+        time.sleep(0.1)
+        if ser_servo and ser_servo.is_open:
+            ser_servo.close()
+        if ser_esp and ser_esp.is_open:
+            ser_esp.close()
+        print("Puertos seriales cerrados correctamente.")
+
+
+if __name__ == '__main__':
+    main()
